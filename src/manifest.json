@@ -2,7 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/nike4613/ModSaber-MetadataFileSchema/master/Schema.json",
   "author": "Umbranox",
   "description": "Fixes OpenXR underswing by matching the old runtime pose prediction paths",
-  "gameVersion": "1.37.1",
+  "gameVersion": "1.45.0",
   "id": "OpenXRUnderswingFix",
   "name": "OpenXR Underswing Fix",
   "version": "0.3.0",
