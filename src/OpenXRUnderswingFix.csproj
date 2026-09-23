@@ -10,6 +10,12 @@
     <OpenXRUnderswingFixUserBeatSaberDir Condition="'$(OpenXRUnderswingFixUserBeatSaberDir)' == '' AND Exists('$(OpenXRUnderswingFixUserProjectFile)')">$([System.Text.RegularExpressions.Regex]::Match($([System.IO.File]::ReadAllText('$(OpenXRUnderswingFixUserProjectFile)')), '(?s)&lt;BeatSaberDir&gt;\s*(.*?)\s*&lt;/BeatSaberDir&gt;').Groups.get_Item(1).Value)</OpenXRUnderswingFixUserBeatSaberDir>
     <BeatSaberDir Condition="'$(BeatSaberDir)' == '' AND '$(OpenXRUnderswingFixUserBeatSaberDir)' != ''">$(OpenXRUnderswingFixUserBeatSaberDir)</BeatSaberDir>
     <BeatSaberDir Condition="'$(BeatSaberDir)' == '' AND '$(OpenXRUnderswingFixGameDirectory)' != ''">$(OpenXRUnderswingFixGameDirectory)</BeatSaberDir>
+    <BeatSaberDir Condition="'$(BeatSaberDir)' == ''">D:\BSManager\BSInstances\1.45.1</BeatSaberDir>
+    <GameDirectory>$(BeatSaberDir)</GameDirectory>
+    <ImportBSMTTargets>true</ImportBSMTTargets>
+    <GenerateManifest>false</GenerateManifest>
+    <CopyPDB>false</CopyPDB>
+    <DisableCopyToGame>false</DisableCopyToGame>
     <GameReferences Condition="'$(GameReferences)' == '' AND '$(BeatSaberDir)' != ''">$(BeatSaberDir)</GameReferences>
     <GameReferences Condition="'$(GameReferences)' == '' AND Exists('$(RepositoryRoot)refs\Beat Saber_Data\Managed\IPA.Loader.dll')">$(RepositoryRoot)refs</GameReferences>
     <BeatSaberDir Condition="'$(BeatSaberDir)' == '' AND '$(GameReferences)' != ''">$(GameReferences)</BeatSaberDir>
@@ -44,10 +50,6 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="OpenXRUnderswingFix.csproj.user" Condition="Exists('OpenXRUnderswingFix.csproj.user')" Visible="false" />
-  </ItemGroup>
-  <ItemGroup>
-    <OutputCopy Include="$(OutputPath)$(AssemblyName).dll" OutputPath="Plugins\$(AssemblyName).dll" />
-    <OutputCopy Include="$(OutputPath)$(AssemblyName).pdb" OutputPath="Plugins\$(AssemblyName).pdb" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="BeatSaberModdingTools.Tasks">
