@@ -10,7 +10,7 @@
     <OpenXRUnderswingFixUserBeatSaberDir Condition="'$(OpenXRUnderswingFixUserBeatSaberDir)' == '' AND Exists('$(OpenXRUnderswingFixUserProjectFile)')">$([System.Text.RegularExpressions.Regex]::Match($([System.IO.File]::ReadAllText('$(OpenXRUnderswingFixUserProjectFile)')), '(?s)&lt;BeatSaberDir&gt;\s*(.*?)\s*&lt;/BeatSaberDir&gt;').Groups.get_Item(1).Value)</OpenXRUnderswingFixUserBeatSaberDir>
     <BeatSaberDir Condition="'$(BeatSaberDir)' == '' AND '$(OpenXRUnderswingFixUserBeatSaberDir)' != ''">$(OpenXRUnderswingFixUserBeatSaberDir)</BeatSaberDir>
     <BeatSaberDir Condition="'$(BeatSaberDir)' == '' AND '$(OpenXRUnderswingFixGameDirectory)' != ''">$(OpenXRUnderswingFixGameDirectory)</BeatSaberDir>
-    <BeatSaberDir Condition="'$(BeatSaberDir)' == ''">D:\BSManager\BSInstances\1.45.1</BeatSaberDir>
+    <BeatSaberDir Condition="'$(BeatSaberDir)' == ''">D:\BSManager\BSInstances\1.45.2</BeatSaberDir>
     <GameDirectory>$(BeatSaberDir)</GameDirectory>
     <ImportBSMTTargets>true</ImportBSMTTargets>
     <GenerateManifest>false</GenerateManifest>
