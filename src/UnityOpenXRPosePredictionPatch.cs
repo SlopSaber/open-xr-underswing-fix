@@ -3,7 +3,9 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace OpenXRUnderswingFix {
     internal static class UnityOpenXRPosePredictionPatch {
@@ -26,6 +28,71 @@ namespace OpenXRUnderswingFix {
         private static long displayPeriod;
         private static bool isSteamVr;
         private static DisplayRefreshRateTracker refreshRateTracker;
+        private static Task<ScanResult> scanTask;
+        private static int scanRevision;
+        private static int revision;
+        private static int queuedRetryRevision = -1;
+        private static int queuedRefreshRevision = -1;
+        private static bool enabled;
+
+        private sealed class ScanRequest {
+            internal readonly int ProcessId;
+            internal readonly IntPtr ModuleBase;
+            internal readonly string RuntimeName;
+            internal readonly byte[] Signature;
+
+            internal ScanRequest(int processId, IntPtr moduleBase, string runtimeName) {
+                ProcessId = processId;
+                ModuleBase = moduleBase;
+                RuntimeName = runtimeName;
+                Signature = (byte[])PoseTimesSignature.Clone();
+            }
+        }
+
+        private sealed class ScanResult {
+            internal readonly ScanRequest Request;
+            internal readonly string ModulePath;
+            internal readonly int ModuleSize;
+            internal readonly int Offset;
+            internal readonly int Matches;
+            internal readonly Exception Error;
+
+            internal ScanResult(ScanRequest request, string modulePath = null,
+                int moduleSize = 0, int offset = -1, int matches = 0, Exception error = null) {
+                Request = request;
+                ModulePath = modulePath;
+                ModuleSize = moduleSize;
+                Offset = offset;
+                Matches = matches;
+                Error = error;
+            }
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ModuleInfo {
+            internal IntPtr BaseOfDll;
+            internal uint SizeOfImage;
+            internal IntPtr EntryPoint;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern IntPtr GetModuleHandle(string moduleName);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool GetModuleHandleEx(uint flags, string moduleName, out IntPtr module);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetModuleFileName(IntPtr module, StringBuilder path, uint size);
+
+        [DllImport("kernel32.dll")]
+        private static extern bool FreeLibrary(IntPtr module);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentProcessId();
+
+        [DllImport("psapi.dll", SetLastError = true)]
+        private static extern bool GetModuleInformation(
+            IntPtr process, IntPtr module, out ModuleInfo information, uint size);
 
         [DllImport("UnityOpenXR", EntryPoint = "NativeConfig_GetRuntimeName")]
         private static extern bool GetRuntimeName(out IntPtr runtimeName);
@@ -71,6 +138,12 @@ namespace OpenXRUnderswingFix {
 
         internal static void Enable() {
             lock (Sync) {
+                if (enabled) {
+                    return;
+                }
+
+                enabled = true;
+                revision++;
                 if (!TryApply()) {
                     retryTimer = new Timer(Retry, null, 250, 250);
                 }
@@ -79,6 +152,8 @@ namespace OpenXRUnderswingFix {
 
         internal static void Disable() {
             lock (Sync) {
+                enabled = false;
+                revision++;
                 refreshTimer?.Dispose();
                 refreshTimer = null;
                 refreshRateTracker = null;
@@ -104,8 +179,27 @@ namespace OpenXRUnderswingFix {
         }
 
         private static void Retry(object _) {
+            int currentRevision;
             lock (Sync) {
-                if (retryTimer == null || !TryApply()) {
+                currentRevision = revision;
+                if (!enabled || retryTimer == null || queuedRetryRevision == currentRevision) {
+                    return;
+                }
+
+                queuedRetryRevision = currentRevision;
+            }
+
+            IPA.Utilities.Async.UnityMainThreadTaskScheduler.Factory.StartNew(
+                () => RetryOnOwner(currentRevision));
+        }
+
+        private static void RetryOnOwner(int currentRevision) {
+            lock (Sync) {
+                if (queuedRetryRevision == currentRevision) {
+                    queuedRetryRevision = -1;
+                }
+
+                if (!enabled || currentRevision != revision || retryTimer == null || !TryApply()) {
                     return;
                 }
 
@@ -115,24 +209,33 @@ namespace OpenXRUnderswingFix {
         }
 
         private static void QueueRefreshRateCheck(object _) {
+            int currentRevision;
             lock (Sync) {
-                if (refreshTimer == null) {
+                currentRevision = revision;
+                if (!enabled || refreshTimer == null || queuedRefreshRevision == currentRevision) {
                     return;
                 }
+
+                queuedRefreshRevision = currentRevision;
             }
 
-            IPA.Utilities.Async.UnityMainThreadTaskScheduler.Factory.StartNew(UpdateDisplayPeriod);
+            IPA.Utilities.Async.UnityMainThreadTaskScheduler.Factory.StartNew(
+                () => UpdateDisplayPeriod(currentRevision));
         }
 
-        private static void UpdateDisplayPeriod() {
-            float refreshRate = GetDisplayRefreshRate();
+        private static void UpdateDisplayPeriod(int currentRevision) {
             lock (Sync) {
-                if (!isSteamVr ||
+                if (queuedRefreshRevision == currentRevision) {
+                    queuedRefreshRevision = -1;
+                }
+
+                if (!enabled || currentRevision != revision || !isSteamVr ||
                     refreshTimer == null ||
                     refreshRateTracker == null) {
                     return;
                 }
 
+                float refreshRate = GetDisplayRefreshRate();
                 int trustedRefreshRate = refreshRateTracker.Observe(refreshRate);
                 if (trustedRefreshRate == 0) {
                     return;
@@ -149,6 +252,8 @@ namespace OpenXRUnderswingFix {
                     if (TryApply()) {
                         retryTimer?.Dispose();
                         retryTimer = null;
+                    } else if (retryTimer == null) {
+                        retryTimer = new Timer(Retry, null, 250, 250);
                     }
 
                     return;
@@ -177,16 +282,19 @@ namespace OpenXRUnderswingFix {
                 return true;
             }
 
-            string runtimeName;
-            try {
-                if (!GetRuntimeName(out IntPtr name) || name == IntPtr.Zero) {
+            if (scanTask != null) {
+                if (!scanTask.IsCompleted) {
                     return false;
                 }
 
-                runtimeName = Marshal.PtrToStringAnsi(name);
-            } catch (DllNotFoundException) {
-                return false;
-            } catch (EntryPointNotFoundException) {
+                ScanResult result = scanTask.GetAwaiter().GetResult();
+                scanTask = null;
+                if (scanRevision == revision) {
+                    return PublishScan(result);
+                }
+            }
+
+            if (!TryGetRuntimeName(out string runtimeName)) {
                 return false;
             }
 
@@ -198,16 +306,47 @@ namespace OpenXRUnderswingFix {
                 refreshTimer = new Timer(QueueRefreshRateCheck, null, 1000, 1000);
             }
 
+            IntPtr moduleBase = GetModuleHandle("UnityOpenXR.dll");
+            if (moduleBase == IntPtr.Zero) {
+                return false;
+            }
+
+            ScanRequest request = new ScanRequest(
+                unchecked((int)GetCurrentProcessId()), moduleBase, runtimeName);
+            scanRevision = revision;
+            scanTask = Task.Factory.StartNew(ScanModule, request, CancellationToken.None,
+                TaskCreationOptions.DenyChildAttach, TaskScheduler.Default);
+            return false;
+        }
+
+        private static bool TryGetRuntimeName(out string runtimeName) {
+            runtimeName = null;
             try {
-                using Process process = Process.GetCurrentProcess();
+                if (!GetRuntimeName(out IntPtr name) || name == IntPtr.Zero) {
+                    return false;
+                }
+
+                runtimeName = Marshal.PtrToStringAnsi(name);
+                return !string.IsNullOrEmpty(runtimeName);
+            } catch (DllNotFoundException) {
+                return false;
+            } catch (EntryPointNotFoundException) {
+                return false;
+            }
+        }
+
+        private static ScanResult ScanModule(object state) {
+            ScanRequest request = (ScanRequest)state;
+            try {
+                using Process process = Process.GetProcessById(request.ProcessId);
                 ProcessModule runtimeModule = process.Modules.Cast<ProcessModule>()
-                    .FirstOrDefault(module => string.Equals(
+                    .FirstOrDefault(module => module.BaseAddress == request.ModuleBase && string.Equals(
                         module.ModuleName,
                         "UnityOpenXR.dll",
                         StringComparison.OrdinalIgnoreCase));
 
                 if (runtimeModule == null) {
-                    return false;
+                    return new ScanResult(request);
                 }
 
                 byte[] moduleBytes = new byte[runtimeModule.ModuleMemorySize];
@@ -223,38 +362,85 @@ namespace OpenXRUnderswingFix {
 
                 int match = -1;
                 int matches = 0;
-                for (int offset = 0; offset <= moduleBytes.Length - PoseTimesSignature.Length; offset++) {
+                for (int offset = 0; offset <= moduleBytes.Length - request.Signature.Length; offset++) {
                     int index = 0;
-                    while (index < PoseTimesSignature.Length &&
-                        moduleBytes[offset + index] == PoseTimesSignature[index]) {
+                    while (index < request.Signature.Length &&
+                        moduleBytes[offset + index] == request.Signature[index]) {
                         index++;
                     }
 
-                    if (index == PoseTimesSignature.Length) {
+                    if (index == request.Signature.Length) {
                         match = offset;
                         matches++;
                     }
                 }
 
-                if (matches != 1) {
-                    Plugin.Log.Warn($"pattern sig matched {matches} times");
-                    return true;
+                return new ScanResult(request, runtimeModule.FileName,
+                    runtimeModule.ModuleMemorySize, match, matches);
+            } catch (Exception ex) {
+                return new ScanResult(request, error: ex);
+            }
+        }
+
+        private static bool PublishScan(ScanResult result) {
+            if (result.Error != null) {
+                Plugin.Log.Warn($"patch failed: {result.Error.Message}");
+                return true;
+            }
+
+            if (result.ModulePath == null || !TryGetRuntimeName(out string runtimeName)) {
+                return false;
+            }
+
+            if (!string.Equals(runtimeName, result.Request.RuntimeName, StringComparison.Ordinal)) {
+                return false;
+            }
+
+            if (result.Matches != 1) {
+                Plugin.Log.Warn($"pattern sig matched {result.Matches} times");
+                return true;
+            }
+
+            if (!GetModuleHandleEx(0, "UnityOpenXR.dll", out IntPtr module)) {
+                return false;
+            }
+
+            try {
+                if (module != result.Request.ModuleBase) {
+                    return false;
                 }
 
-                IntPtr address = IntPtr.Add(runtimeModule.BaseAddress, match);
+                using Process process = Process.GetCurrentProcess();
+                if (!GetModuleInformation(process.Handle, module, out ModuleInfo information,
+                    (uint)Marshal.SizeOf<ModuleInfo>()) ||
+                    information.BaseOfDll != module || information.SizeOfImage != result.ModuleSize) {
+                    return false;
+                }
+
+                StringBuilder modulePath = new StringBuilder(1024);
+                uint pathLength = GetModuleFileName(module, modulePath, (uint)modulePath.Capacity);
+                if (pathLength == 0 || pathLength >= modulePath.Capacity ||
+                    !string.Equals(modulePath.ToString(), result.ModulePath, StringComparison.OrdinalIgnoreCase)) {
+                    return false;
+                }
+
+                IntPtr address = IntPtr.Add(module, result.Offset);
                 WriteBytes(
                     process,
                     address,
-                    CreatePatch(isSteamVr ? displayPeriod : 0));
+                    CreatePatch(isSteamVr ? displayPeriod : 0),
+                    result.Request.Signature);
                 patchAddress = address;
 
-                long patchOffset = address.ToInt64() - runtimeModule.BaseAddress.ToInt64();
+                long patchOffset = address.ToInt64() - module.ToInt64();
                 string prediction = displayPeriod != 0
                     ? $"{NanosecondsPerSecond / (double)displayPeriod:0.##}hz"
                     : "render time";
                 Plugin.Log.Info($"patched {runtimeName} at +0x{patchOffset:X} ({prediction})");
             } catch (Exception ex) {
                 Plugin.Log.Warn($"patch failed: {ex.Message}");
+            } finally {
+                FreeLibrary(module);
             }
 
             return true;
@@ -273,10 +459,26 @@ namespace OpenXRUnderswingFix {
             return patch;
         }
 
-        private static void WriteBytes(Process process, IntPtr address, byte[] bytes) {
+        private static void WriteBytes(Process process, IntPtr address, byte[] bytes, byte[] expectedBytes = null) {
             UIntPtr size = new UIntPtr((uint)bytes.Length);
+            byte[] currentBytes = expectedBytes != null ? new byte[expectedBytes.Length] : null;
+            InvalidOperationException changedSignature = expectedBytes != null
+                ? new InvalidOperationException("Native pose signature changed before publication.")
+                : null;
             List<IntPtr> suspendedThreads = SuspendOtherThreads(process);
             try {
+                if (expectedBytes != null) {
+                    if (!ReadProcessMemory(process.Handle, address, currentBytes, currentBytes.Length, IntPtr.Zero)) {
+                        throw changedSignature;
+                    }
+
+                    for (int index = 0; index < expectedBytes.Length; index++) {
+                        if (currentBytes[index] != expectedBytes[index]) {
+                            throw changedSignature;
+                        }
+                    }
+                }
+
                 if (!VirtualProtect(address, size, PageExecuteReadWrite, out uint oldProtection)) {
                     throw new InvalidOperationException(
                         $"VirtualProtect failed: {Marshal.GetLastWin32Error()}");
